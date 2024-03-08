@@ -1,0 +1,4 @@
+Download from:
+https://finance.yahoo.com/
+
+Search currency pair {base}{foreign}, goto "Historical" and download csv
