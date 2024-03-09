@@ -8,13 +8,14 @@ from decimal import Decimal
 
 import pandas as pd
 
+import bs4
 from bs4 import BeautifulSoup
 from io import StringIO
 import sys
 
 import setup
-from datatypes import ItemType, Stock, ClosedLot, Trade, Order, TradeList, TaxPots
-from utils import parse_date
+from datatypes import ItemType, Stock, ClosedLot, Trade, Order, TradeList, TaxCalc
+from utils import parse_date, ExchangeRate
 
 
 class TaxReportIBKR:
@@ -26,8 +27,7 @@ class TaxReportIBKR:
         self.dividends = TradeList()
         self.trades = TradeList()
         self._trades_assigned_open = TradeList()
-        self.tax_pots = TaxPots()
-        self.kap_lines = None
+        self.tax_calc = TaxCalc()
         self._read_html()
         self._read_csv()
 
@@ -63,37 +63,56 @@ class TaxReportIBKR:
     #     to_stock = lambda x:
     #     df["Stock"] =
     #     df["ISIN"] = df["ISIN"].apply(lambda x: x.upper()
-    def get_dividends(self):
-        table = (
-            self.soup.find("div", {"id": f"secCombDiv_{self.account}Heading"})
-            .find_next_sibling("div")
-            .find("table")
-        )
+    def _parse_html_table(
+        self, div_id: str, data_len: int, itemtype: ItemType, tradelist: TradeList
+    ):
+        """Parse table under section `div_id` in HTML file.
+        Data rows have `data_len` columns of type `itemtype`.
+        Each result is appended to `tradelist`.
+        Used to fetch dividends and withholding tax sections.
+        """
+        table = self.soup.find("div", {"id": div_id}).find_next_sibling("div").find("table")
         currency = None
         for row in table.find_all("tr"):
             td = row.find_all("td")
             if len(td) == 1 and td[0].text in setup.CURRENCIES:
                 # currency section
                 currency = td[0].text
-            elif len(td) == 3:
+            elif len(td) == data_len:
                 match = re.search(r"^([A-Z1-9.]+)\(((\w{2})\w{10})\)", td[1].text)
                 if match:
                     symbol = match.group(1)
                     isin = match.group(2)
                     country = match.group(3)
                 else:
-                    raise ValueError(f"Couldn't parse ISIN: {td[1].text}")
+                    raise ValueError(f"Couldn't parse text: {td[1].text}")
                 stock = Stock(name=td[1].text, symbol=symbol, country=country, isin=isin)
                 item = Trade(
                     stock=stock,
                     size=1,
-                    type=ItemType.DIVIDEND_PAYOUT,
+                    type=itemtype,
                     timestamp=parse_date(td[0].text),
                     price=float(td[2].text),
                     currency=currency,
                 )
-                self.dividends.append(item)
+                tradelist.append(item)
+
+    def get_dividends(self) -> TradeList:
+        div_id = f"secCombDiv_{self.account}Heading"
+        itemtype = ItemType.DIVIDEND_PAYOUT
+        self._parse_html_table(div_id, 3, itemtype, self.dividends)
+
+        div_id = f"secWithholdingTax_{self.account}Heading"
+        itemtype = ItemType.WITHHOLDING_TAX
+        self._parse_html_table(div_id, 4, itemtype, self.dividends)
+
         return self.dividends
+
+    def get_transaction_fees_df(self):
+        df = self._csv_to_df_base("Transaction Fees")
+        df["Date/Time"] = df["Date/Time"].astype("datetime64[s]")
+        df["Amount"] = df["Amount"].str.replace(",", "").astype(float)
+        return df.loc[df["Asset Category"] != "Total", :].copy()
 
     def get_broker_interest_paid_df(self):
         df = self._csv_to_df_base("Broker Interest Paid")
@@ -133,78 +152,30 @@ class TaxReportIBKR:
         df["option_type"] = df["option_type"].astype(str)
         return df
 
-    def _get_trades_base(self, df, categories: list[str]):
+    def _get_trades_base(
+        self, df, categories: list[str], apply_trades_assigned_open: bool = False
+    ):
         current_order = None
         current_trade = None
         for ix, row in df.loc[df["Asset Category"].isin(categories)].iterrows():
             codes = row["Code"].split(";")
-            if row["DataDiscriminator"] == "Order" and "C" in codes:
+            is_option_open = (row["Asset Category"] == "Equity and Index Options") and "O" in codes
+            if row["DataDiscriminator"] == "Order" and ("C" in codes or is_option_open):
                 current_order = Order.from_row(row)
-            elif row["DataDiscriminator"] == "Trade" and "C" in codes:
+            elif row["DataDiscriminator"] == "Trade" and ("C" in codes or is_option_open):
                 current_trade = Trade.from_row(row)
                 current_trade.order = current_order
                 current_order.trades.append(current_trade)
                 self.trades.append(current_trade)
             elif row["DataDiscriminator"] == "Trade":
-                # non-closing trade is ignored
-                current_trade = None
-            elif row["DataDiscriminator"] == "ClosedLot" and current_trade is not None:
-                closed_lot = ClosedLot.from_row(row)
-                closed_lot.trade = current_trade
-                current_trade.closed_lots.append(closed_lot)
-
-    def get_trades(self):
-        df = self.get_trades_df()
-        self.trades = TradeList()
-        self._trades_assigned_open = TradeList()
-        categories = ["Warrants", "Structured Products", "Equity and Index Options"]
-        self._get_trades_base(df, categories)
-
-        # now link all assigned / exercised stocks to option trades
-        # because source table doesn't provide correct closedLot trade prices
-        # ("Stillhalterprämie" is added as virtual gain.
-        # Keep assigned opened trades in lookup queue
-        for ix, row in df.loc[df["Asset Category"] == "Stocks"].iterrows():
-            codes = row["Code"].split(";")
-            if row["DataDiscriminator"] == "Order" and "A" in codes and "O" in codes:
-                current_order = Order.from_row(row)
-            elif row["DataDiscriminator"] == "Trade" and "A" in codes and "O" in codes:
-                trade = Trade.from_row(row)
-                trade.order = current_order
-                # if there is an equivalent trade (same strike, date), add size
-                found = False
-                for t in self._trades_assigned_open:
-                    if (
-                        t.stock.symbol == trade.stock.symbol
-                        and t.timestamp == trade.timestamp
-                        and t.price == trade.price
-                    ):
-                        t.size += trade.size
-                        found = True
-                if not found:
-                    self._trades_assigned_open.append(trade)
-        self._trades_assigned_open.sort_by_date_asc()
-
-        # now do all the stocks. stocks with assigned open trades get modified
-        current_order = None
-        current_trade = None
-        for ix, row in df.loc[df["Asset Category"] == "Stocks"].iterrows():
-            codes = row["Code"].split(";")
-            if row["DataDiscriminator"] == "Order" and "C" in codes:
-                current_order = Order.from_row(row)
-            elif row["DataDiscriminator"] == "Trade" and "C" in codes:
-                current_trade = Trade.from_row(row)
-                current_trade.order = current_order
-                current_order.trades.append(current_trade)
-                self.trades.append(current_trade)
-            elif row["DataDiscriminator"] == "Trade":
-                # non-closing trade is ignored
+                # other trades are ignored
                 current_trade = None
             elif row["DataDiscriminator"] == "ClosedLot" and current_trade is not None:
                 cl = ClosedLot.from_row(row)
                 cl.trade = current_trade
-                # check if the closed lot fits symbol and timestamp of an assigned open lot
-                # if so, adjust price of closed lot
+                current_trade.closed_lots.append(cl)
+                if not apply_trades_assigned_open:
+                    continue
 
                 opens = self._trades_assigned_open
                 opens = opens[::-1] if "LI" in codes else opens
@@ -215,7 +186,6 @@ class TaxReportIBKR:
                         if t.size >= cl_size:
                             price_size.append((t.price, cl_size))
                             t.size -= cl_size
-                            cl_size = 0
                             break
                         else:
                             price_size.append((t.price, t.size))
@@ -224,23 +194,85 @@ class TaxReportIBKR:
                 if price_size:
                     cl.price = sum(map(lambda x: x[0] * x[1], price_size)) / cl.size
 
-                current_trade.closed_lots.append(cl)
+    def get_trades(self):
+        df = self.get_trades_df()
 
+        self.trades = TradeList()
+        self._trades_assigned_open = TradeList()
+        categories = ["Warrants", "Structured Products", "Equity and Index Options"]
+        self._get_trades_base(df, categories)
+
+        # now link all assigned / exercised stocks to option trades
+        # because source table doesn't provide correct closedLot trade prices
+        # ("Stillhalterprämie" is added there as virtual gain which violates tax law)
+        # Keep assigned opened trades in lookup queue
+        current_order = None
+        current_trade = None
+        for ix, row in df.loc[df["Asset Category"] == "Stocks"].iterrows():
+            codes = row["Code"].split(";")
+            if row["DataDiscriminator"] == "Order" and "A" in codes and "O" in codes:
+                current_order = Order.from_row(row)
+            elif row["DataDiscriminator"] == "Trade" and "A" in codes and "O" in codes:
+                current_trade = Trade.from_row(row)
+                current_trade.order = current_order
+                # if there is an equivalent trade (same strike, date), add size
+                already_found = False
+                for t in self._trades_assigned_open:
+                    if (
+                        t.stock.symbol == current_trade.stock.symbol
+                        and t.timestamp == current_trade.timestamp
+                        and t.price == current_trade.price
+                    ):
+                        t.size += current_trade.size
+                        already_found = True
+                if not already_found:
+                    self._trades_assigned_open.append(current_trade)
+        self._trades_assigned_open.sort_by_date_asc()
+
+        # now do all the stocks. stocks with assigned open trades get modified
+        self._get_trades_base(df, ["Stocks"], apply_trades_assigned_open=True)
+
+        # if transaction fees were paid, assign them as additional commission
+        trans_fees = self.get_transaction_fees_df()
+        for ix, row in trans_fees.iterrows():
+            dt = row["Date/Time"].date()
+            if row["Symbol"] == "":
+                print(f"WARNING. Transaction fee has no symbol and is not considered: {row}")
+                continue
+            found_trade = False
+            for t in self.trades.by_symbol(row["Symbol"]):
+                for cl in t.closed_lots:
+                    if cl.timestamp.date() != dt:
+                        continue
+                    cl.commission += ExchangeRate.convert(
+                        row["Amount"], dt, row["Currency"], row["Amount"]
+                    )
+                    found_trade = True
+            if not found_trade:
+                # fallback: try closing trade also
+                for t in self.trades.by_symbol(row["Symbol"]):
+                    if t.timestamp.date() != row["Date/Time"].date():
+                        continue
+                    t.commission += ExchangeRate.convert(
+                        row["Amount"], dt, row["Currency"], row["Amount"]
+                    )
+                    found_trade = True
+                if not found_trade:
+                    print(f"WARNING. Trade to transaction fee could not be found: {row}")
+
+        # finally distribute interest across all trades
         self.trades.distribute_interest(self.get_broker_interest_paid())
         return self.trades
 
     def process(self):
         trades = self.get_trades()
         div = self.get_dividends()
-        self.tax_pots.add_trades(trades)
-        self.tax_pots.add_trades(div)
-        print(self.tax_pots)
-        self.kap_lines = self.tax_pots.KAP_lines()
-        print("KAP lines: ", self.kap_lines)
+        self.tax_calc.add_trades(trades)
+        self.tax_calc.add_trades(div)
+        print(self.tax_calc)
 
 
 if __name__ == "__main__":
-    r1 = TaxReportIBKR(2021)
-    # r2 = TaxReportIBKR(2022)
-    r1.process()
-    # r2.process()
+    r = TaxReportIBKR(2022)
+    r.process()
+    r.trades.to_df("trades2022.xlsx")
