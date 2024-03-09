@@ -88,7 +88,7 @@ class TaxCalc:
         ):
             pass  # writer premium already considered; exercise via stock trade
         else:
-            raise NotImplementedError(f"No TaxPot for {trade.type}: {trade}")
+            raise NotImplementedError(f"No TaxCalc for {trade.type}: {trade}")
 
     def add_trades(self, trades: TradeList):
         for i, trade in enumerate(trades):
@@ -130,7 +130,7 @@ class TaxCalc:
         und Gewinne aus Termingeschäften
         (entspricht vermutlich §20 Abs 1. Nr. 11 (Stillhalterprämien) und
         §20 Abs. 2 Nr. 3 (steuerliche Termingeschäfte))
-        Unklar: Zertifikate, Optionsscheine etc.?
+        Unklar: Zertifikate, Optionsscheine etc.? -> vermutlich nicht
         """
         return tax_round(self.WRITER_PREMIUM + self.OTHER_GAIN_LIMITED, "down")
 
