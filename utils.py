@@ -35,6 +35,17 @@ def parse_date(date: str):
     raise ValueError(f"Couldn't parse date: {date}")
 
 
+def tax_round(x: float, direction: str = "down") -> int:
+    """Tax-conform rounding down to whole values"""
+    assert direction in ("up", "down")
+    if (direction == "down" and x > 0) or (direction == "up" and x < 0) or x == 0:
+        return int(x)
+    elif direction == "down" and x < 0:
+        return int(x - 1)
+    elif direction == "up" and x > 0:
+        return int(x + 1)
+
+
 def converter_decimal(x):
     try:
         return Decimal(x)
@@ -42,7 +53,7 @@ def converter_decimal(x):
         return None
 
 
-class _ExchangeRate:
+class _ExchangeRate(metaclass=Singleton):
     PATH: str = "data_forex"
 
     def __init__(self):
@@ -96,6 +107,8 @@ class _ExchangeRate:
         base_currency: str = setup.BASE_CURRENCY,
     ) -> float:
         """Convert amount from foreign currency to base currency at given date."""
+        if currency == base_currency:
+            return amount
         return amount / self.at(date, currency, sign, base_currency)
 
     def convert_back(
@@ -107,6 +120,8 @@ class _ExchangeRate:
         base_currency: str = setup.BASE_CURRENCY,
     ) -> float:
         """Convert amount from base currency to foreign currency at given date."""
+        if currency == base_currency:
+            return amount
         return amount * self.at(date, currency, sign, base_currency)
 
 

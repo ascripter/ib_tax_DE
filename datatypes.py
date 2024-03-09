@@ -5,94 +5,107 @@ from dataclasses import dataclass, field
 from enum import Enum
 import re
 from typing import Union
-
+from pathlib import Path
 import pandas as pd
 
 import setup
-from utils import ExchangeRate, Singleton
-
-
-TAX_POT_NAMES = [
-    "DIVIDEND",
-    "STOCK_GAIN",
-    "OTHER_GAIN",
-    "OTHER_GAIN_LIMITED",  # Stillhalterprämien und Termingeschäfte
-    "STOCK_LOSS",
-    "OTHER_LOSS",
-    "OTHER_LOSS_LIMITED",  # Termingeschäfte; bis 20k € gem. §20 Abs. 6 S. 5
-    "WORTHLESS_LIMITED",  # Wirtschaftsgüter; bis 20k € gem. §20 Abs. 6 S. 6
-    # "WITHHOLDING_TAX",
-]
-
-
-# class TaxPot(Enum):
-#     STOCK_GAIN = 1
-#     STOCK_LOSS = 11
-#     OTHER_GAIN = 2
-#     OTHER_LOSS = 12
-#     OTHER_LOSS_LIMITED = 22
-#     WORTHLESS_LIMITED = 23
-#     WITHHOLDING_TAX = 3
+from utils import ExchangeRate, tax_round, Singleton
 
 
 @dataclass
 # class _TaxPots(metaclass=Singleton):
-class TaxPots:
+class TaxCalc:
     DIVIDEND: float = 0.0
+    WRITER_PREMIUM: float = 0.0  # Stillhalterprämien
     STOCK_GAIN: float = 0.0
-    OTHER_GAIN: float = 0.0
-    OTHER_GAIN_LIMITED: float = 0.0  # Stillhalterprämien und Termingeschäfte
+    OTHER_GAIN_LIMITED: float = 0.0  # Termingeschäfte i. S. d. dt. Steuerrechts
+    OTHER_GAIN: float = 0.0  # all other instruments
     STOCK_LOSS: float = 0.0
-    OTHER_LOSS: float = 0.0
     OTHER_LOSS_LIMITED: float = 0.0  # Termingeschäfte; bis 20k € gem. §20 Abs. 6 S. 5
+    OTHER_LOSS: float = 0.0  # all other instruments
     WORTHLESS_LIMITED: float = 0.0  # Wirtschaftsgüter; bis 20k € gem. §20 Abs. 6 S. 6
-    # WITHHOLDING_TAX: float = 0.0  # not implemented
+    WITHHOLDING_TAX: float = 0.0
 
     def __str__(self):
         names = self.__dict__.keys()
-        lst = [f"{name:<18s} : {getattr(self, name):>11.2f}" for name in names]
-        return "<TaxPots\n  " + "\n  ".join(lst) + ">"
+        b = setup.BASE_CURRENCY
+        pots = [f"{name:<18s} : {getattr(self, name):>11.2f} {b}" for name in names]
+        kap = [f"KAP line {str(i):<9s} : {v:>8d}.-- {b}" for i, v in self.KAP_lines.items()]
+        return "<TaxCalc\n  " + "\n  ".join(pots + ["---"] + kap) + ">"
 
     def __repr__(self):
         return self.__str__()
 
     def add_trade(self, trade: Trade):
         """Distribute outcome of a trade"""
-        net_gain = trade.net_gain()
-        if trade.worthless:
-            self.WORTHLESS_LIMITED += net_gain
+        if trade.is_worthless:
+            self.WORTHLESS_LIMITED += trade.net_gain()
         elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country != "DE":
-            # German dividends are already taxed
-            self.DIVIDEND += net_gain
+            # German dividends are already taxed, include only others
+            self.DIVIDEND += trade.net_gain()
         elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country == "DE":
             print(f"Excluding dividend payout for German stock: {trade}")
-        elif trade.type in ItemType.TAXPOT_LIMITED:
-            self.OTHER_GAIN_LIMITED += max(net_gain, 0)
-            self.OTHER_LOSS_LIMITED += min(net_gain, 0)
-        elif trade.type in ItemType.TAXPOT_OTHER:
-            self.OTHER_GAIN += max(net_gain, 0)
-            self.OTHER_LOSS += min(net_gain, 0)
-        elif trade.type in ItemType.TAXPOT_STOCK:
-            self.STOCK_GAIN += max(net_gain, 0)
-            self.STOCK_LOSS += min(net_gain, 0)
+        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country != "DE":
+            self.WITHHOLDING_TAX += trade.net_gain()
+        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country == "DE":
+            print(f"Excluding withholding tax for German stock: {trade}")
+        elif trade.type == ItemType.OPTION_SHORT_OPEN:
+            self.WRITER_PREMIUM += trade.net_gain()
+        elif trade.type == ItemType.OPTION_SHORT_CLOSED:
+            # only closing half trade, since open was already added to writer premium
+            self.OTHER_LOSS += trade.proceeds_closed()
+        elif trade.type == ItemType.OPTION_SHORT_EXERCISED_CASH_SETTLED:
+            # only closing half trade, since open was already added to writer premium
+            self.OTHER_LOSS_LIMITED += trade.proceeds_closed()
+            raise NotImplementedError("Option short exercised cash settled not tested")
+        elif trade.type in (
+            ItemType.OPTION_LONG_EXERCISED_CASH_SETTLED,
+            ItemType.OPTION_LONG_CLOSED,
+            ItemType.OPTION_LONG_EXPIRED,
+            ItemType.CFD_LONG,
+            ItemType.CFD_SHORT,
+        ):
+            # all round trades classified as "Termingeschäfte i. S. d. dt. Steuerrechts"
+            self.OTHER_GAIN_LIMITED += max(trade.net_gain(), 0)
+            self.OTHER_LOSS_LIMITED += min(trade.net_gain(), 0)
+        elif trade.type == ItemType.OPTION_LONG_EXERCISED:
+            raise NotImplementedError("Option long exercised not tested")
+            # todo: find corresponding stock trade and add option premium to cost
+        elif trade.type in (
+            ItemType.WARRANT_LONG,
+            ItemType.STRUCTURED_LONG,
+            ItemType.ETF_LONG,
+        ):
+            self.OTHER_GAIN += max(trade.net_gain(), 0)
+            self.OTHER_LOSS += min(trade.net_gain(), 0)
+        elif trade.type in (ItemType.STOCK_LONG, ItemType.STOCK_SHORT):
+            self.STOCK_GAIN += max(trade.net_gain(), 0)
+            self.STOCK_LOSS += min(trade.net_gain(), 0)
+        elif trade.type in (
+            ItemType.OPTION_LONG_OPEN,
+            ItemType.OPTION_SHORT_EXERCISED,
+            ItemType.OPTION_SHORT_EXPIRED,
+        ):
+            pass  # writer premium already considered; exercise via stock trade
         else:
-            raise ValueError(f"No TaxPot for {trade.type}: {trade}")
+            raise NotImplementedError(f"No TaxPot for {trade.type}: {trade}")
 
     def add_trades(self, trades: TradeList):
         for i, trade in enumerate(trades):
             self.add_trade(trade)
 
-    def KAP_line18(self) -> float:
+    def KAP_line18(self) -> int:
         """Inländische Kapitalerträge (ohne Betrag lt. Zeile 26)
         (IBKR is a non-german broker, so "Inländische Kapitalerträge" is zero)
         """
         return 0
 
-    def KAP_line19(self) -> float:
+    def KAP_line19(self) -> int:
         """Ausländische Kapitalerträge (ohne Betrag lt. Zeile 50)"""
         s1 = sum(map(lambda x: getattr(self, x), self.__dict__.keys()))
         s2 = (
             self.DIVIDEND
+            + self.WRITER_PREMIUM
             + self.STOCK_GAIN
             + self.OTHER_GAIN
             + self.OTHER_GAIN_LIMITED
@@ -100,54 +113,62 @@ class TaxPots:
             + self.OTHER_LOSS
             + self.OTHER_LOSS_LIMITED
             + self.WORTHLESS_LIMITED
+            + self.WITHHOLDING_TAX
         )
         assert s1 == s2
-        return round(s1, 2)
+        return tax_round(s1, "down")
 
-    def KAP_line20(self) -> float:
+    def KAP_line20(self) -> int:
         """In den Zeilen 18 und 19 enthaltene Gewinne aus Aktienveräußerungen
         i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
         (Anteile einer Körperschaft)
         """
-        return round(self.STOCK_GAIN, 2)
+        return tax_round(self.STOCK_GAIN, "down")
 
-    def KAP_line21(self) -> float:
+    def KAP_line21(self) -> int:
         """In den Zeilen 18 und 19 enthaltene Einkünfte aus Stillhalterprämien
         und Gewinne aus Termingeschäften
         (entspricht vermutlich §20 Abs 1. Nr. 11 (Stillhalterprämien) und
         §20 Abs. 2 Nr. 3 (steuerliche Termingeschäfte))
         Unklar: Zertifikate, Optionsscheine etc.?
         """
-        return round(self.OTHER_GAIN + self.OTHER_GAIN_LIMITED, 2)
+        return tax_round(self.WRITER_PREMIUM + self.OTHER_GAIN_LIMITED, "down")
 
-    def KAP_line22(self) -> float:
+    def KAP_line22(self) -> int:
         """In den Zeilen 18 und 19 enthaltene Verluste ohne Verluste
         aus der Veräußerung von Aktien
         """
-        return -round(self.OTHER_LOSS + self.OTHER_LOSS_LIMITED + self.WORTHLESS_LIMITED, 2)
+        v = (
+            -self.OTHER_LOSS
+            - self.OTHER_LOSS_LIMITED
+            - self.WORTHLESS_LIMITED
+            - self.WITHHOLDING_TAX
+        )
+        return tax_round(v, "up")
 
-    def KAP_line23(self) -> float:
+    def KAP_line23(self) -> int:
         """In den Zeilen 18 und 19 enthaltene Verluste aus der Veräußerung
         von Aktien i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
         """
-        return -round(self.STOCK_LOSS, 2)
+        return tax_round(-self.STOCK_LOSS, "up")
 
-    def KAP_line24(self) -> float:
+    def KAP_line24(self) -> int:
         """Verluste aus Termingeschäften gem. §20 Abs. 2 Nr. 3
         (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 5 gilt,
         nur verrechenbar mit §20 Abs 1. Nr. 11 (Stillhalterprämien) und
         §20 Abs. 2 Nr. 3 (Gewinne aus steuerlichen Termingeschäften))"""
-        return -round(self.OTHER_LOSS_LIMITED, 2)
+        return tax_round(-self.OTHER_LOSS_LIMITED, "up")
 
-    def KAP_line25(self) -> float:
+    def KAP_line25(self) -> int:
         """Verluste aus der ganzen oder teilweisen Uneinbringlichkeit einer
         Kapitalforderung, Ausbuchung, Übertragung wertlos gewordener Wirtschaftsgüter
         i. S. d. § 20 Abs. 1 EStG oder aus einem sonstigen Ausfall
         von Wirtschaftsgütern i. S. d. § 20 Abs. 1 EStG
         (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 6 gilt)
         """
-        return -round(self.WORTHLESS_LIMITED, 2)
+        return tax_round(-self.WORTHLESS_LIMITED, "up")
 
+    @property
     def KAP_lines(self) -> dict[int, float]:
         result = {}
         for i in range(18, 26):
@@ -155,115 +176,123 @@ class TaxPots:
         return result
 
 
-# TaxPots = _TaxPots()  # instantiate Singleton class
-
-
 class ItemType(Enum):
     UNDEFINED = -1
     STOCK_LONG = 1
-    STOCK_SHORT = 51
     OPTION_LONG_CLOSED = 2
-    OPTION_LONG_CALL_EXERCISED = 3  # or assigned
-    OPTION_LONG_PUT_EXERCISED = 4  # or assigned
-    OPTION_LONG_CALL_EXERCISED_CASH_SETTLED = 13  # or assigned
-    OPTION_LONG_PUT_EXERCISED_CASH_SETTLED = 14  # or assigned
+    OPTION_LONG_EXERCISED = 3  # or assigned
+    OPTION_LONG_EXERCISED_CASH_SETTLED = 4  # or assigned
     OPTION_LONG_EXPIRED = 5
-    OPTION_SHORT_CLOSED = 52
-    OPTION_SHORT_CALL_EXERCISED = 53  # or assigned
-    OPTION_SHORT_PUT_EXERCISED = 54  # or assigned
-    OPTION_SHORT_CALL_EXERCISED_CASH_SETTLED = 63  # or assigned
-    OPTION_SHORT_PUT_EXERCISED_CASH_SETTLED = 64  # or assigned
-    OPTION_SHORT_EXPIRED = 55
     CFD_LONG = 6
-    CFD_SHORT = 56
     WARRANT_LONG = 7
     STRUCTURED_LONG = 8
     ETF_LONG = 9
-    DIVIDEND_PAYOUT = 101
+    STOCK_SHORT = 51
+    OPTION_SHORT_CLOSED = 52
+    OPTION_SHORT_EXERCISED = 53  # or assigned
+    OPTION_SHORT_EXERCISED_CASH_SETTLED = 54  # or assigned
+    OPTION_SHORT_EXPIRED = 55
+    CFD_SHORT = 56
+    OPTION_LONG_OPEN = 101
+    OPTION_SHORT_OPEN = 102
+    DIVIDEND_PAYOUT = 103
+    WITHHOLDING_TAX = 104
 
-    # following types not implemented (not traded)
-    @classmethod
-    @property
-    def TAXPOT_STOCK(cls) -> list[ItemType]:
-        """All ItemTypes that put losses into OTHER_LOSS"""
-        return [cls.STOCK_LONG, cls.STOCK_SHORT]
+    # @classmethod
+    # @property
+    # def TAXPOT_STOCK(cls) -> list[ItemType]:
+    #     """All ItemTypes that put losses into OTHER_LOSS"""
+    #     return [cls.STOCK_LONG, cls.STOCK_SHORT]
+    #
+    # @classmethod
+    # @property
+    # def TAXPOT_OTHER(cls) -> list[ItemType]:
+    #     """All ItemTypes that put losses into OTHER_LOSS"""
+    #     return [
+    #         cls.OPTION_SHORT_CLOSED,
+    #         cls.OPTION_SHORT_EXERCISED,
+    #         # cls.OPTION_SHORT_PUT_EXERCISED,
+    #         cls.OPTION_SHORT_EXPIRED,
+    #         cls.WARRANT_LONG,
+    #         cls.STRUCTURED_LONG,
+    #         cls.ETF_LONG,
+    #     ]
+    #     # excluded = [cls.STOCK_LONG, cls.STOCK_SHORT, cls.DIVIDEND_PAYOUT] + cls.TAXPOT_LIMITED
+    #     # return [_ for _ in cls if _ not in excluded]
+    #
+    # @classmethod
+    # @property
+    # def TAXPOT_LIMITED(cls) -> list[ItemType]:
+    #     """All ItemTypes that put losses into OTHER_LOSS_LIMITED"""
+    #     result = cls.OPTION_CASH_SETTLED
+    #     result.extend(
+    #         [cls.OPTION_LONG_CLOSED, cls.OPTION_LONG_EXPIRED, cls.CFD_LONG, cls.CFD_SHORT]
+    #     )
+    #     return result
 
-    @classmethod
-    @property
-    def TAXPOT_OTHER(cls) -> list[ItemType]:
-        """All ItemTypes that put losses into OTHER_LOSS"""
-        return [
-            cls.OPTION_SHORT_CLOSED,
-            cls.OPTION_SHORT_CALL_EXERCISED,
-            cls.OPTION_SHORT_PUT_EXERCISED,
-            cls.OPTION_SHORT_EXPIRED,
-            cls.WARRANT_LONG,
-            cls.STRUCTURED_LONG,
-            cls.ETF_LONG,
-        ]
-        # excluded = [cls.STOCK_LONG, cls.STOCK_SHORT, cls.DIVIDEND_PAYOUT] + cls.TAXPOT_LIMITED
-        # return [_ for _ in cls if _ not in excluded]
+    def is_round_trade(self) -> bool:
+        return self.value <= 100
 
-    @classmethod
-    @property
-    def TAXPOT_LIMITED(cls) -> list[ItemType]:
-        """All ItemTypes that put losses into OTHER_LOSS_LIMITED"""
-        result = cls.OPTION_CASH_SETTLED
-        result.extend(
-            [cls.OPTION_LONG_CLOSED, cls.OPTION_LONG_EXPIRED, cls.CFD_LONG, cls.CFD_SHORT]
-        )
-        return result
-
-    @classmethod
-    @property
-    def TRADE(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.value <= 100]
-
-    @classmethod
-    @property
-    def OTHER(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.value > 100]
-
-    @classmethod
-    @property
-    def LONG(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.value <= 50]
-
-    @classmethod
-    @property
-    def SHORT(cls) -> list[ItemType]:
-        return [_ for _ in cls if 50 <= _.value <= 100]
-
-    @classmethod
-    @property
-    def OPTION(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.name.startswith("OPTION_")]
-
-    @classmethod
-    @property
-    def OPTION_LONG(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.name.startswith("OPTION_LONG")]
-
-    @classmethod
-    @property
-    def OPTION_SHORT(cls) -> list[ItemType]:
-        return [_ for _ in cls if _.name.startswith("OPTION_SHORT")]
-
-    @classmethod
-    @property
-    def OPTION_EXERCISED(cls) -> list[ItemType]:
-        return [_ for _ in cls if "OPTION" in _.name and "EXERCISED" in _.name]
-
-    @classmethod
-    @property
-    def OPTION_CASH_SETTLED(cls) -> list[ItemType]:
-        return [_ for _ in cls if "OPTION" in _.name and "CASH_SETTLED" in _.name]
+    def is_open_trade(self) -> bool:
+        return self.name.endswith("_OPEN")
 
     def is_long(self):
-        return self in self.LONG
+        return self.value < 50
 
     def is_short(self):
-        return self in self.SHORT
+        return self.value >= 51 and self.value <= 100
+
+    def is_other(self) -> bool:
+        return self.value > 100
+
+    def is_option(self) -> bool:
+        return self.name.startswith("OPTION_")
+
+    def is_option_long(self) -> bool:
+        return self.name.startswith("OPTION_LONG")
+
+    def is_option_short(self) -> bool:
+        return self.name.startswith("OPTION_SHORT")
+
+    def is_option_exercised(self) -> bool:
+        return self.name.endswith("_EXERCISED") and "OPTION" in self.name
+
+    def is_option_cash_settled(self) -> bool:
+        return "CASH_SETTLED" in self.name and "OPTION" in self.name
+
+    @classmethod
+    def from_row(cls, row):
+        """Defer trade type from row in csv file"""
+        codes = row["Code"].split(";")
+        if row["DataDiscriminator"] == "ClosedLot":
+            return cls.UNDEFINED
+        if "C" in codes and "O" in codes:
+            # in this case use only the closing part
+            codes.remove("O")
+
+        ls = "LONG"
+        if ("C" in codes and row["Quantity"] > 0) or ("O" in codes and row["Quantity"] < 0):
+            ls = "SHORT"
+
+        if row["Asset Category"] == "Equity and Index Options":
+            # cp = "CALL" if row["Symbol"][-1] == "C" else "PUT"
+            if "O" in codes:
+                return getattr(cls, f"OPTION_{ls}_OPEN")
+            elif "Ex" in codes or "A" in codes:
+                return getattr(cls, f"OPTION_{ls}_EXERCISED")
+            elif "Ep" in codes:
+                return getattr(cls, f"OPTION_{ls}_EXPIRED")
+            elif "C" in codes:
+                return getattr(cls, f"OPTION_{ls}_CLOSED")
+            raise ValueError("Unexpected row: ", row)
+        elif row["Asset Category"] == "Stocks":
+            return getattr(cls, f"STOCK_{ls}")
+        elif row["Asset Category"] == "Structured Products":
+            return getattr(cls, f"STRUCTURED_{ls}")
+        elif row["Asset Category"] == "Warrants":
+            return getattr(cls, f"WARRANT_{ls}")
+        raise ValueError("Unexpected row: ", row)
+        # todo: CFD, ETF, cash settled Option
 
 
 @dataclass
@@ -302,7 +331,7 @@ class _Item:
     option_date: datetime.date = None
     option_strike: float = None
     interest: float = 0  # Margin interest paid (negative; in base currency)
-    worthless: bool = False  # whether this is a worthless item (separate tax pot)
+    is_worthless: bool = False  # whether this is a worthless item (tax pot §20 Abs 6 S 6)
 
     def __str__(self):
         code = self.get_code()
@@ -331,40 +360,19 @@ class _Item:
         return code
 
     def _str_base(self):
-        symbol = self.symbol_option if self.type in ItemType.OPTION else self.stock.symbol
+        symbol = self.symbol_option if self.type.is_option() else self.stock.symbol
         return (
             f"{symbol:5s} on {self.timestamp.strftime('%Y-%m-%d')}:",
             f"{self.type.name:<12s}  {self.size:>6.1f} x {self.price:>8.3f} {self.commission:+.2f}",
         )
 
     @classmethod
-    def _item_type_from_row(cls, row):
-        """Defer trade type from *Closing Trade* defined in row"""
-        codes = row["Code"].split(";")
-        if "C" not in codes:
-            return ItemType.UNDEFINED
-        ls = "LONG" if row["Quantity"] < 0 else "SHORT"
-        if row["Asset Category"] == "Equity and Index Options":
-            cp = "CALL" if row["Symbol"][-1] == "C" else "PUT"
-            if "Ex" in codes or "A" in codes:
-                return getattr(ItemType, f"OPTION_{ls}_{cp}_EXERCISED")
-            closing = "EXPIRED" if "Ep" in codes else "CLOSED"
-            return getattr(ItemType, f"OPTION_{ls}_{closing}")
-        elif row["Asset Category"] == "Stocks":
-            return getattr(ItemType, f"STOCK_{ls}")
-        elif row["Asset Category"] == "Structured Products":
-            return getattr(ItemType, f"STRUCTURED_{ls}")
-        elif row["Asset Category"] == "Warrants":
-            return getattr(ItemType, f"WARRANT_{ls}")
-        raise ValueError("Unexpected row: ", row)
-        # todo: CFD, ETF, cash settled Option
-
-    @classmethod
     def from_row(cls, row):
+        """Generate _Item from a row in the csv file"""
         codes = row["Code"].split(";")
-        tp = cls._item_type_from_row(row)
+        tp = ItemType.from_row(row)
         commission = row["Comm/Fee"] if pd.notna(row["Comm/Fee"]) else 0
-        worthless = {
+        is_worthless = {
             "Stocks": False,
             "Equity and Index Options": False,
             "Warrants": ("Ex" in codes or "Ep" in codes) and row["T. Price"] == 0,
@@ -383,8 +391,8 @@ class _Item:
             option_date=row["option_date"],
             option_strike=row["option_strike"],
             option_type=row["option_type"],
-            interest=0,
-            worthless=worthless,
+            interest=0,  # in base currency (that's avl. in the report)
+            is_worthless=is_worthless,
         )
 
     def proceeds(self, base_currency: bool = True, size: float = None) -> float:
@@ -392,7 +400,7 @@ class _Item:
         If size is None, this Item's proceeds will be returned, otherwise size can
         be overridden i.e. by the parent Trade of a ClosedLot.
         """
-        lotsize = 100.0 if self.type in ItemType.OPTION else 1.0
+        lotsize = 100.0 if self.type.is_option() else 1.0
         size = -self.size if size is None else size
 
         amount = size * self.price * lotsize + self.commission
@@ -479,17 +487,27 @@ class Trade(_Item):
 
     def size_closed(self) -> float:
         """Size of the Trade that was closed"""
-        if self.type not in ItemType.TRADE:
+        if self.type.is_open_trade():
+            return -self.size
+        elif not self.type.is_round_trade():
             # special item types that aren't actual trades
             return self.size
+        # part of the trade that was closed (if not fully)
         return sum(map(lambda x: x.size, self.closed_lots))
 
     def proceeds_closed(self, base_currency: bool = True) -> float:
         """Only the fraction of lots that were closed by this trade are tax relevant"""
+        if self.type.is_open_trade():
+            return 0
         return self.proceeds(base_currency, self.size_closed())
 
     def proceeds_open(self, base_currency: bool = True) -> float:
         """Sum of all associated open position that were closed"""
+        if self.type.is_open_trade():
+            return self.proceeds(base_currency, -self.size)
+        elif self.type.is_option_short():
+            # premium was already handled by opening trade
+            return 0
         return sum(map(lambda x: x.proceeds(base_currency), self.closed_lots))
 
     def net_gain(self, base_currency: bool = True) -> float:
@@ -520,6 +538,8 @@ class TradeList(list):
             return [t for t in self if t.type == item_type]
 
     def by_symbol(self, symbol: str, timestamp: datetime.datetime = None):
+        if symbol == "":
+            return []
         timestamp = datetime.datetime(1970, 1, 1) if timestamp is None else timestamp
         result = []
         for i, trade in enumerate(self):
@@ -551,7 +571,7 @@ class TradeList(list):
             wt = trade.trade_weight() / weight_total
             trade.interest = wt * interest
 
-    def to_df(self):
+    def to_df(self, excel_filename: str | Path = None):
         rows = []
         for trade in self:
             row = {
@@ -587,6 +607,8 @@ class TradeList(list):
 
             rows.append(row)
         df = pd.DataFrame.from_records(rows)
+        if excel_filename:
+            df.to_excel(excel_filename, index=False)
         return df
 
     def line19(self):
