@@ -81,11 +81,13 @@ class TaxReportIBKR:
         Each result is appended to `tradelist`.
         Used to fetch dividends and withholding tax sections.
         """
+        if self.soup is None:
+            return
         table = self.soup.find("div", {"id": div_id}).find_next_sibling("div").find("table")
         currency = None
         for row in table.find_all("tr"):
             td = row.find_all("td")
-            if len(td) == 1 and td[0].text in setup.CURRENCIES:
+            if len(td) == 1 and "header-currency" in td[0]["class"]:
                 # currency section
                 currency = td[0].text
             elif len(td) == data_len:
@@ -102,7 +104,7 @@ class TaxReportIBKR:
                     size=1,
                     type=itemtype,
                     timestamp=parse_date(td[0].text),
-                    price=float(td[2].text),
+                    price=float(td[2].text.replace(",", "")),
                     currency=currency,
                 )
                 tradelist.append(item)
