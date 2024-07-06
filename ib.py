@@ -96,9 +96,13 @@ class TaxReportIBKR:
                     symbol = match.group(1)
                     isin = match.group(2)
                     country = match.group(3)
+                    stock = Stock(name=td[1].text, symbol=symbol, country=country, isin=isin)
                 else:
-                    raise ValueError(f"Couldn't parse text: {td[1].text}")
-                stock = Stock(name=td[1].text, symbol=symbol, country=country, isin=isin)
+                    stock = Stock(name=td[1].text)
+                    print(
+                        f'{div_id}: Couldn\'t parse text in HTML file "{td[1].text}": "{td[2].text} {currency}". '
+                        "No info added to stock object."
+                    )
                 item = Trade(
                     stock=stock,
                     size=1,
