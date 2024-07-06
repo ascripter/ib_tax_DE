@@ -58,19 +58,22 @@ class _ExchangeRate(metaclass=Singleton):
 
     def __init__(self):
         self.rates = {}
-        self.read_yahoo_finance_csv()
+        self._read_yahoo_finance_csv()
 
-    def read_yahoo_finance_csv(self):
+    def _read_yahoo_finance_csv(self):
         for path in Path(self.PATH).glob("*.csv"):
             df = pd.read_csv(path, parse_dates=["Date"])
+            df["OC_max"] = df.loc[:, ["Open", "Close"]].max(axis=1)
+            df["OC_min"] = df.loc[:, ["Open", "Close"]].min(axis=1)
             self.rates[path.stem] = df
 
     def exchange_rate_df(
         self, currency: str, base_currency: str = setup.BASE_CURRENCY
     ) -> pd.DataFrame:
-        if currency not in setup.CURRENCIES:
-            raise ValueError(f"Currency not supported: {currency}")
-        return self.rates[f"{base_currency.upper()}{currency.upper()}"]
+        key = f"{base_currency.upper()}{currency.upper()}"
+        if key not in self.rates.keys():
+            raise KeyError(f"Exchange rate not found: {key}. Download it from Yahoo Finance.")
+        return self.rates[key]
 
     def at(
         self,
@@ -82,8 +85,6 @@ class _ExchangeRate(metaclass=Singleton):
         if currency == base_currency:
             return 1.0
         df = self.exchange_rate_df(currency, base_currency)
-        df["OC_max"] = df.loc[:, ["Open", "Close"]].max(axis=1)
-        df["OC_min"] = df.loc[:, ["Open", "Close"]].min(axis=1)
         ix = (
             (df["Date"] <= date)
             & pd.notna(df["Open"])
@@ -91,11 +92,13 @@ class _ExchangeRate(metaclass=Singleton):
             & pd.notna(df["Low"])
             & pd.notna(df["Close"])
         )
-        try:
-            row = df.loc[ix, :].iloc[-1, :]
-            rate = row[TABLE_COLUMNS(sign)].mean()
-        except IndexError:
-            raise IndexError(f"No data for {date} in {base_currency.upper()}{currency.upper()}")
+        if ix.size == 0 or df["Date"].max() < date:
+            raise IndexError(
+                f"No data for {date} in {base_currency.upper()}{currency.upper()}. "
+                "Download current data from Yahoo Finance."
+            )
+        row = df.loc[ix, :].iloc[-1, :]
+        rate = row[TABLE_COLUMNS(sign)].mean()
         return rate
 
     def convert(
