@@ -126,8 +126,10 @@ class TaxReportIBKR:
 
         return self.dividends
 
-    def get_transaction_fees_df(self):
+    def get_transaction_fees_df(self) -> pd.DataFrame:
         df = self._csv_to_df_base("Transaction Fees")
+        if df is None:
+            return pd.DataFrame()
         df["Date/Time"] = df["Date/Time"].astype("datetime64[s]")
         df["Amount"] = df["Amount"].str.replace(",", "").astype(float)
         return df.loc[df["Asset Category"] != "Total", :].copy()
