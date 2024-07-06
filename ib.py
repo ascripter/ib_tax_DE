@@ -3,9 +3,11 @@
 # no long options, no cash settled options (not traded; no data)
 
 
+import datetime
 import re
 from decimal import Decimal
-
+from pathlib import Path
+from typing import Optional
 import pandas as pd
 
 import bs4
@@ -14,24 +16,29 @@ from io import StringIO
 import sys
 
 import setup
-from datatypes import ItemType, Stock, ClosedLot, Trade, Order, TradeList, TaxCalc
+from datatypes import TaxRule, ItemType, Stock, ClosedLot, Trade, Order, TradeList, TaxCalc
 from utils import parse_date, ExchangeRate
 
 
 class TaxReportIBKR:
-    def __init__(self, tax_year: int, account: str = setup.ACCOUNT):
-        self.html_file = setup.HTML_REPORT[tax_year]
-        self.csv_file = setup.CSV_REPORT[tax_year]
-        self.account = account
-        self.tax_year = tax_year
-        self.dividends = TradeList()
-        self.trades = TradeList()
-        self._trades_assigned_open = TradeList()
-        self.tax_calc = TaxCalc()
+    def __init__(self, tax_year: int, tax_rule: TaxRule, account: str = setup.ACCOUNT):
+        self.tax_rule: TaxRule = tax_rule
+        self.html_file: str = setup.HTML_REPORT[tax_year]
+        self.csv_file: str = setup.CSV_REPORT[tax_year]
+        self.account: str = account
+        self.tax_year: int = tax_year
+        self.dividends: Optional[TradeList] = None
+        self.trades: Optional[TradeList] = None
+        self._trades_assigned_open: Optional[TradeList] = None
+        self.tax_calc: TaxCalc = TaxCalc(tax_rule)
         self._read_html()
         self._read_csv()
 
     def _read_html(self):
+        if not Path(self.html_file).exists():
+            print("HTML file doesn't exist, skip dividends and withholding tax: ", self.html_file)
+            self.soup = None
+            return
         with open(self.html_file, "r") as f:
             content = f.read()
         self.soup = BeautifulSoup(content, "html.parser")
@@ -48,8 +55,11 @@ class TaxReportIBKR:
             usecols=[_ for _ in range(17)],
         )
 
-    def _csv_to_df_base(self, section: str) -> pd.DataFrame:
+    def _csv_to_df_base(self, section: str) -> Optional[pd.DataFrame]:
         df0 = self.csv.loc[self.csv[0] == section]
+        if df0.shape[0] == 0:
+            print("Section not found: ", section)
+            return None
         header = df0.loc[df0[1] == "Header", :].values[0]
         df = df0.loc[df0[1] == "Data", 2:].copy()
         df.columns = header[2:]
@@ -98,6 +108,8 @@ class TaxReportIBKR:
                 tradelist.append(item)
 
     def get_dividends(self) -> TradeList:
+        self.dividends = TradeList(self.tax_rule)
+
         div_id = f"secCombDiv_{self.account}Heading"
         itemtype = ItemType.DIVIDEND_PAYOUT
         self._parse_html_table(div_id, 3, itemtype, self.dividends)
@@ -197,8 +209,8 @@ class TaxReportIBKR:
     def get_trades(self):
         df = self.get_trades_df()
 
-        self.trades = TradeList()
-        self._trades_assigned_open = TradeList()
+        self.trades = TradeList(self.tax_rule)
+        self._trades_assigned_open = TradeList(self.tax_rule)
         categories = ["Warrants", "Structured Products", "Equity and Index Options"]
         self._get_trades_base(df, categories)
 
