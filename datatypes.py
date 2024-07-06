@@ -605,7 +605,3 @@ class TradeList(list):
         if excel_filename:
             df.to_excel(excel_filename, index=False)
         return df
-
-    def line19(self):
-        """Get Result German Tax report line 19"""
-        pass
