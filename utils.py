@@ -10,8 +10,8 @@ import pandas as pd
 import setup
 
 EXCHANGE_TABLES = {}
-TABLE_COLUMNS = (
-    lambda x: ["Open", "High", "Low", "Close"]
+TABLE_COLUMNS = lambda x: (
+    ["Open", "High", "Low", "Close"]
     if x == 0
     else (["High", "OC_max"] if x > 0 else ["Low", "OC_min"])
 )
@@ -24,6 +24,49 @@ class Singleton(type):
         if cls not in cls._instances:
             cls._instances[cls] = super(Singleton, cls).__call__(*args, **kwargs)
         return cls._instances[cls]
+
+
+def wrap_text(s: str, n_chars: int) -> str:
+    """Wrap string after at least n_chars, but not in the middle of a word"""
+    if not s or n_chars <= 0:
+        return s
+
+    # Split on whitespace and hyphens
+    tokens = re.split(r"\s|(-)", s)
+
+    # Filter out empty strings that might result from splitting
+    tokens = [token for token in tokens if token]
+
+    if not tokens:
+        return s
+
+    result = []
+    current_line = tokens[0]
+
+    for prev_token, token in zip(tokens[:-1], tokens[1:]):
+        # if token is a hyphen, always add it
+        if token == "-":
+            current_line += "-"
+            continue
+
+        # Check if adding the next token would exceed n_chars
+        potential_line = current_line + ("" if prev_token == "-" else " ") + token
+
+        if len(potential_line) > n_chars:
+            # Only wrap if current line is at least n_chars long
+            if len(current_line) >= n_chars:
+                result.append(current_line)
+                current_line = token
+            else:
+                # Current line is shorter than n_chars, so add the token anyway
+                current_line = potential_line
+        else:
+            current_line = potential_line
+
+    # Add the last line
+    result.append(current_line.strip())
+
+    return "\n".join(result)
 
 
 def parse_date(date: str):
