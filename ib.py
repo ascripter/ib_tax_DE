@@ -17,6 +17,7 @@ import sys
 
 import setup
 from datatypes import TaxRule, ItemType, Stock, ClosedLot, Trade, Order, TradeList, TaxCalc
+from df_to_pdf import DataFrameToPDF
 from utils import parse_date, ExchangeRate
 
 
@@ -284,27 +285,51 @@ class TaxReportIBKR:
         self.trades.distribute_interest(self.get_broker_interest_paid())
         return self.trades
 
-    def process(self, save: bool = False):
+    def process(self, save_xlsx: bool = True, save_pdf: bool = True):
         trades = self.get_trades()
-        div = self.get_dividends()
+        dividends = self.get_dividends()
         self.tax_calc.add_trades(trades)
-        self.tax_calc.add_trades(div)
+        self.tax_calc.add_trades(dividends)
+
+        output_dir = Path(Path(__file__).parent, setup.OUTPUT_DIR)
+        if not output_dir.exists():
+            output_dir.mkdir()
+
+        with open(Path(output_dir, f"TaxCalc{self.tax_year}.txt"), "w") as f:
+            f.write(str(self.tax_calc))
         print(self.tax_calc)
 
-        if not save:
-            return
+        dfs = [dividends.to_df(), trades.to_df()] + [
+            tl.to_df(open_lots=True) for tl in self.tax_calc.KAP_lines_trades.values()
+        ]
+        filenames_prefix = [f"dividends{self.tax_year}", f"trades{self.tax_year}"] + [
+            f"trades{self.tax_year}_KAP{line}" for line in self.tax_calc.KAP_lines_trades.keys()
+        ]
 
-        div_df = div.to_df()
-        trades_df = trades.to_df()
-        for df, fn in (
-            (div_df, f"dividends{self.tax_year}.xlsx"),
-            (trades_df, f"trades{self.tax_year}.xlsx"),
-        ):
+        pdf_generator = DataFrameToPDF(
+            Path(output_dir, f"trades{self.tax_year}_KAP.pdf"),
+            "A4",
+            "landscape",
+            min_font_size=6,
+            max_font_size=6,
+            pagination_strategy="columns_first",
+            min_width_factor=1,
+        )
+        for i, (df, fn_pref) in enumerate(zip(dfs, filenames_prefix)):
+            fn_xlsx = Path(output_dir, f"{fn_pref}.xlsx")
             try:
-                df.to_excel(fn, index=False)
+                if save_xlsx:
+                    df.to_excel(fn_xlsx, index=False)
             except OSError as exc:
                 print(f"Saving dataframe failed: {exc}")
                 dt_str = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-                fn_new = f"{Path(fn).stem}_{dt_str}.xlsx"
+                fn_new = Path(output_dir, f"{fn_pref}_{dt_str}.xlsx")
                 print(f"Saving instead as '{fn_new}'")
                 df.to_excel(fn_new, index=False)
+
+            if i > 1 and save_pdf:
+                # skip dividends and full trade list. This one is for tax administration
+                pdf_generator.add_dataframe_to_pdf(df, title=fn_pref)
+
+        if save_pdf:
+            pdf_generator.generate_pdf()
