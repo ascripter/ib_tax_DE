@@ -9,7 +9,7 @@ from pathlib import Path
 import pandas as pd
 
 import setup
-from utils import ExchangeRate, tax_round, Singleton
+from utils import ExchangeRate, tax_round, wrap_text
 
 
 class TaxRule(Enum):
@@ -426,44 +426,48 @@ class TradeList(list):
             wt = trade.trade_weight() / weight_total
             trade.interest = wt * interest
 
-    def to_df(self, excel_filename: str | Path = None):
+    def to_df(self, excel_filename: str | Path = None, open_lots: bool = True):
         rows = []
         for trade in self:
             row = {
-                "symbol": trade.stock.symbol,
+                "symbol": wrap_text(trade.stock.symbol, 20),
                 "country": trade.stock.country,
-                "option": re.sub(r"^\w+\b\s+", "", trade.symbol_option)
-                if trade.symbol_option is not None
-                else "",
-                "code": trade.get_code(),
+                "option": (
+                    re.sub(r"^\w+\b\s+", "", trade.symbol_option)
+                    if trade.symbol_option is not None
+                    else ""
+                ),
+                "code": wrap_text(trade.get_code(), 15),
                 "trade_type": trade.type.name,
                 "currency": trade.currency,
                 "timestamp": trade.timestamp,
-                "exchange_rate": ExchangeRate.at(
-                    trade.timestamp, trade.currency, trade.proceeds_closed()
+                "exchange_rate": round(
+                    ExchangeRate.at(trade.timestamp, trade.currency, trade.proceeds_closed()), 5
                 ),
                 "size": trade.size_closed(),
                 "price": trade.price,
-                "commission": trade.commission,
-                f"interest_{setup.BASE_CURRENCY}": trade.interest,
-                f"proceeds_{setup.BASE_CURRENCY}": trade.proceeds_closed(),
-                f"proceeds_{setup.BASE_CURRENCY}_open": trade.proceeds_open(),
-                f"net_gain_{setup.BASE_CURRENCY}": trade.net_gain(),
+                "commission": round(trade.commission, 2),
+                f"interest_{setup.BASE_CURRENCY}": round(trade.interest, 2),
+                f"proceeds_{setup.BASE_CURRENCY}": round(trade.proceeds_closed(), 2),
+                f"proceeds_{setup.BASE_CURRENCY}_open": round(trade.proceeds_open(), 2),
+                f"net_gain_{setup.BASE_CURRENCY}": round(trade.net_gain(), 2),
                 "comment": "",
             }
             if self.tax_rule is not None:
                 if not TradeFilter(self.tax_rule).include(trade, True):
                     row["comment"] = "Not tax relevant"
 
+            if not open_lots:
+                continue
             for i, cl in enumerate(trade.closed_lots):
                 row[f"timestamp_open{i:02d}"] = cl.timestamp
-                row[f"exchange_rate_open{i:02d}"] = ExchangeRate.at(
-                    cl.timestamp, cl.currency, cl.proceeds()
+                row[f"exchange_rate_open{i:02d}"] = round(
+                    ExchangeRate.at(cl.timestamp, cl.currency, cl.proceeds()), 5
                 )
                 row[f"size_open{i:02d}"] = cl.size
-                row[f"price_open{i:02d}"] = cl.price
-                row[f"commission_open{i:02d}"] = cl.commission
-                row[f"proceeds_{setup.BASE_CURRENCY}_open{i:02d}"] = cl.proceeds()
+                row[f"price_open{i:02d}"] = round(cl.price, 2)
+                row[f"commission_open{i:02d}"] = round(cl.commission, 2)
+                row[f"proceeds_{setup.BASE_CURRENCY}_open{i:02d}"] = round(cl.proceeds(), 2)
 
             rows.append(row)
         df = pd.DataFrame.from_records(rows)
