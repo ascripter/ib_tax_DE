@@ -368,6 +368,14 @@ class TradeList(list):
     def __repr__(self):
         return f"<TradeList: {len(self)} trades>"
 
+    def __add__(self, other):
+        if isinstance(other, TradeList):
+            result = TradeList(self.tax_rule)
+            result.extend(self)
+            result.extend(other)
+            return result
+        return super().__add__(other)
+
     def sort_by_date_asc(self):
         self.sort(key=lambda x: x.timestamp)
 
