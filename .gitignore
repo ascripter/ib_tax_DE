@@ -48,5 +48,6 @@ Thumbs.db
 *.mov
 *.wmv
 
-# Generated Excel files
+# Generated output
+output/
 *.xlsx

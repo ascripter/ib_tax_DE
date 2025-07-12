@@ -9,251 +9,13 @@ from pathlib import Path
 import pandas as pd
 
 import setup
-from utils import ExchangeRate, tax_round, Singleton
+from utils import ExchangeRate, tax_round, wrap_text
 
 
 class TaxRule(Enum):
     """Marker for applied tax legislation"""
 
     DE = 0  # current law (of 2021 onwards)
-
-
-class TradeFilter:
-    """Manager to implement different tax legislation (TaxRule)."""
-
-    def __init__(self, tax_rule: TaxRule):
-        self.tax_rule = tax_rule
-
-    def include(self, trade: Trade, silent: bool = False) -> bool:
-        if self.tax_rule == TaxRule.DE:
-            return True
-            # if (
-            #     trade.type in (ItemType.DIVIDEND_PAYOUT, ItemType.WITHHOLDING_TAX)
-            #     and trade.stock.country == "DE"
-            # ):
-            #     if not silent:
-            #         print(f"{self.tax_rule}: Already taxed => exclude from TaxReport: {trade}")
-            #     return False
-            # return True
-        else:
-            raise NotImplementedError()
-
-    def _add_trade_DE(self, trade: Trade, tax_calc: TaxCalc):
-        if self.include(trade) is False:
-            return
-        if trade.is_worthless:
-            tax_calc.WORTHLESS_LIMITED += trade.net_gain()
-        elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country == "DE":
-            tax_calc.DIVIDEND_DE += trade.net_gain()
-        elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country != "DE":
-            tax_calc.DIVIDEND_OTHER += trade.net_gain()
-        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country == "DE":
-            tax_calc.WITHHOLDING_TAX_DE += trade.net_gain()
-        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country != "DE":
-            tax_calc.WITHHOLDING_TAX_OTHER += trade.net_gain()
-        elif trade.type == ItemType.OPTION_SHORT_OPEN:
-            tax_calc.WRITER_PREMIUM += trade.net_gain()
-        elif trade.type == ItemType.OPTION_SHORT_CLOSED:
-            # only closing half trade, since open was already added to writer premium
-            tax_calc.OTHER_LOSS += trade.proceeds_closed()
-        elif trade.type == ItemType.OPTION_SHORT_EXERCISED_CASH_SETTLED:
-            # only closing half trade, since open was already added to writer premium
-            tax_calc.OTHER_LOSS_LIMITED += trade.proceeds_closed()
-            raise NotImplementedError("Option short exercised cash settled not tested")
-        elif trade.type in (
-            ItemType.OPTION_LONG_EXERCISED_CASH_SETTLED,
-            ItemType.OPTION_LONG_CLOSED,
-            ItemType.OPTION_LONG_EXPIRED,
-            ItemType.CFD_LONG,
-            ItemType.CFD_SHORT,
-        ):
-            # all round trades classified as "Termingeschäfte i. S. d. dt. Steuerrechts"
-            tax_calc.OTHER_GAIN_LIMITED += max(trade.net_gain(), 0)
-            tax_calc.OTHER_LOSS_LIMITED += min(trade.net_gain(), 0)
-        elif trade.type == ItemType.OPTION_LONG_EXERCISED:
-            raise NotImplementedError("Option long exercised not tested")
-            # todo: find corresponding stock trade and add option premium to cost
-        elif trade.type in (
-            ItemType.WARRANT_LONG,
-            ItemType.STRUCTURED_LONG,
-            ItemType.ETF_LONG,
-        ):
-            tax_calc.OTHER_GAIN += max(trade.net_gain(), 0)
-            tax_calc.OTHER_LOSS += min(trade.net_gain(), 0)
-        elif trade.type in (ItemType.STOCK_LONG, ItemType.STOCK_SHORT):
-            tax_calc.STOCK_GAIN += max(trade.net_gain(), 0)
-            tax_calc.STOCK_LOSS += min(trade.net_gain(), 0)
-        elif trade.type in (
-            ItemType.OPTION_LONG_OPEN,
-            ItemType.OPTION_SHORT_EXERCISED,
-            ItemType.OPTION_SHORT_EXPIRED,
-        ):
-            pass  # writer premium already considered; exercise via stock trade
-        else:
-            raise NotImplementedError(f"No TaxCalc for {trade.type}: {trade}")
-
-    def add_trade(self, trade: Trade, tax_calc: TaxCalc):
-        """Distribute outcome of a trade to the buckets of a TaxCalc object."""
-        return getattr(self, f"_add_trade_{self.tax_rule.name}")(trade, tax_calc)
-
-
-@dataclass
-# class _TaxPots(metaclass=Singleton):
-class TaxCalc:
-    _trade_filter: TradeFilter = field(init=False)
-    tax_rule: TaxRule
-    DIVIDEND_DE: float = 0.0  # Dividend (and Lieu of Dividend) for German stocks
-    DIVIDEND_OTHER: float = 0.0  # Dividend (and Lieu of Dividend) for non-German stocks
-    WRITER_PREMIUM: float = 0.0  # Stillhalterprämien
-    STOCK_GAIN: float = 0.0
-    OTHER_GAIN_LIMITED: float = 0.0  # Termingeschäfte i. S. d. dt. Steuerrechts
-    OTHER_GAIN: float = 0.0  # all other instruments
-    STOCK_LOSS: float = 0.0
-    OTHER_LOSS_LIMITED: float = 0.0  # Termingeschäfte; bis 20k € gem. §20 Abs. 6 S. 5
-    OTHER_LOSS: float = 0.0  # all other instruments
-    WORTHLESS_LIMITED: float = 0.0  # Wirtschaftsgüter; bis 20k € gem. §20 Abs. 6 S. 6
-    WITHHOLDING_TAX_DE: float = 0.0  # W. from dividend payments of German stocks
-    WITHHOLDING_TAX_OTHER: float = 0.0  # W. from dividend payments of non-German stocks
-
-    def __post_init__(self):
-        self._trade_filter = TradeFilter(self.tax_rule)
-
-    def __str__(self):
-        def amount_str(v: Union[float, int]):
-            return f"{v:>8d}.--" if isinstance(v, int) else f"{v:>11.2f}"
-
-        names = self._float_field_names()
-        b = setup.BASE_CURRENCY
-        pots = [f"{name:<21s} : {getattr(self, name):>11.2f} {b}" for name in names]
-        kap = [
-            f"KAP line {str(i):<12s} : {amount_str(v)} {b}  ({self.KAP_lines_annotations[i]})"
-            for i, v in self.KAP_lines.items()
-        ]
-        return "<TaxCalc\n  " + "\n  ".join(pots + ["---"] + kap) + ">"
-
-    def __repr__(self):
-        return self.__str__()
-
-    def _float_field_names(self):
-        return [f.name for f in fields(self) if f.type == "float"]
-
-    def add_trade(self, trade: Trade):
-        self._trade_filter.add_trade(trade, self)
-
-    def add_trades(self, trades: TradeList):
-        for i, trade in enumerate(trades):
-            self.add_trade(trade)
-
-    def KAP_line18(self) -> int:
-        """Inländische Kapitalerträge (ohne Betrag lt. Zeile 26)
-        (IBKR is a non-german broker, so "Inländische Kapitalerträge" is zero
-        except for dividends from German stocks)
-        """
-        s = self.DIVIDEND_DE + self.WITHHOLDING_TAX_DE
-        return tax_round(s, "down")
-
-    def KAP_line19(self) -> int:
-        """Ausländische Kapitalerträge (ohne Betrag lt. Zeile 50)"""
-        s1 = sum(map(lambda x: getattr(self, x), self._float_field_names())) - (
-            self.DIVIDEND_DE + self.WITHHOLDING_TAX_DE
-        )
-        s2 = (
-            self.DIVIDEND_OTHER
-            + self.WRITER_PREMIUM
-            + self.STOCK_GAIN
-            + self.OTHER_GAIN
-            + self.OTHER_GAIN_LIMITED
-            + self.STOCK_LOSS  # losses have negative sign, so add them
-            + self.OTHER_LOSS
-            + self.OTHER_LOSS_LIMITED
-            + self.WORTHLESS_LIMITED
-            + self.WITHHOLDING_TAX_OTHER
-        )
-        assert s1 == s2
-        return tax_round(s1, "down")
-
-    def KAP_line20(self) -> int:
-        """In den Zeilen 18 und 19 enthaltene Gewinne aus Aktienveräußerungen
-        i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
-        (Anteile einer Körperschaft)
-        """
-        return tax_round(self.STOCK_GAIN, "down")
-
-    def KAP_line21(self) -> int:
-        """In den Zeilen 18 und 19 enthaltene Einkünfte aus Stillhalterprämien
-        und Gewinne aus Termingeschäften
-        (entspricht vermutlich §20 Abs 1. Nr. 11 (Stillhalterprämien) und
-        §20 Abs. 2 Nr. 3 (steuerliche Termingeschäfte))
-        Unklar: Zertifikate, Optionsscheine etc.? -> vermutlich nicht
-        """
-        return tax_round(self.WRITER_PREMIUM + self.OTHER_GAIN_LIMITED, "down")
-
-    def KAP_line22(self) -> int:
-        """In den Zeilen 18 und 19 enthaltene Verluste ohne Verluste
-        aus der Veräußerung von Aktien
-        """
-        v = -self.OTHER_LOSS - self.OTHER_LOSS_LIMITED - self.WORTHLESS_LIMITED
-        return tax_round(v, "up")
-
-    def KAP_line23(self) -> int:
-        """In den Zeilen 18 und 19 enthaltene Verluste aus der Veräußerung
-        von Aktien i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
-        """
-        return tax_round(-self.STOCK_LOSS, "up")
-
-    def KAP_line24(self) -> int:
-        """Verluste aus Termingeschäften gem. §20 Abs. 2 Nr. 3
-        (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 5 gilt,
-        nur verrechenbar mit §20 Abs 1. Nr. 11 (Stillhalterprämien) und
-        §20 Abs. 2 Nr. 3 (Gewinne aus steuerlichen Termingeschäften))"""
-        return tax_round(-self.OTHER_LOSS_LIMITED, "up")
-
-    def KAP_line25(self) -> int:
-        """Verluste aus der ganzen oder teilweisen Uneinbringlichkeit einer
-        Kapitalforderung, Ausbuchung, Übertragung wertlos gewordener Wirtschaftsgüter
-        i. S. d. § 20 Abs. 1 EStG oder aus einem sonstigen Ausfall
-        von Wirtschaftsgütern i. S. d. § 20 Abs. 1 EStG
-        (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 6 gilt)
-        """
-        return tax_round(-self.WORTHLESS_LIMITED, "up")
-
-    def KAP_line41(self):
-        """Noch anzurechnende ausländische Steuern"""
-        return round(-self.WITHHOLDING_TAX_OTHER, 2)
-
-    def KAP_line43(self):
-        """Einbehaltene inländische Steuerabzüge: Anzurechnende Kapitalertragssteuer"""
-        # total fraction is 1.055 since aggregate value *includes* 5.5% Soli
-        # return tax_round(-self.WITHHOLDING_TAX_DE * (1 / 1.055), "up")
-        return round(-self.WITHHOLDING_TAX_DE * (1 / 1.055), 2)
-
-    def KAP_line44(self):
-        """Einbehaltene inländische Steuerabzüge: Anzurechnender Solidaritätszuschlag"""
-        # return tax_round(-self.WITHHOLDING_TAX_DE * (0.055 / 1.055), "up")
-        return round(-self.WITHHOLDING_TAX_DE * (0.055 / 1.055), 2)
-
-    @property
-    def KAP_lines(self) -> dict[int, float]:
-        result = {}
-        for i in list(range(18, 26)) + [41, 43, 44]:
-            result[i] = getattr(self, f"KAP_line{i}")()
-        return result
-
-    @property
-    def KAP_lines_annotations(self) -> dict[int, str]:
-        return {
-            18: "Inländische Kapitalerträge",
-            19: "Ausländische Kapitalerträge",
-            20: "In 18 und 19 enth. Gewinne aus Aktienveräußerungen",
-            21: "In 18 und 19 enth. Stillhalterprämien und Gewinne aus Termingeschäften",
-            22: "In 18 und 19 enth. Verluste (ohne Verluste Aktien)",
-            23: "In 18 und 19 enth. Verluste aus Aktien",
-            24: "Verluste aus Termingeschäften mit Verlustanrechnungsbeschränkung",
-            25: "Verluste aus Uneinbringlichkeit von Kapitalforderungen",
-            41: "Noch anzurechnende ausländische Steuern",
-            43: "Einbehaltene inländische Steuerabzüge: Anzurechnende Kapitalertragssteuer",
-            44: "Einbehaltene inländische Steuerabzüge: Anzurechnender Solidaritätszuschlag",
-        }
 
 
 class ItemType(Enum):
@@ -606,6 +368,14 @@ class TradeList(list):
     def __repr__(self):
         return f"<TradeList: {len(self)} trades>"
 
+    def __add__(self, other):
+        if isinstance(other, TradeList):
+            result = TradeList(self.tax_rule)
+            result.extend(self)
+            result.extend(other)
+            return result
+        return super().__add__(other)
+
     def sort_by_date_asc(self):
         self.sort(key=lambda x: x.timestamp)
 
@@ -656,47 +426,374 @@ class TradeList(list):
             wt = trade.trade_weight() / weight_total
             trade.interest = wt * interest
 
-    def to_df(self, excel_filename: str | Path = None):
+    def to_df(self, excel_filename: str | Path = None, open_lots: bool = True):
         rows = []
         for trade in self:
             row = {
-                "symbol": trade.stock.symbol,
+                "symbol": wrap_text(trade.stock.symbol, 20),
                 "country": trade.stock.country,
-                "option": re.sub(r"^\w+\b\s+", "", trade.symbol_option)
-                if trade.symbol_option is not None
-                else "",
-                "code": trade.get_code(),
+                "option": (
+                    re.sub(r"^\w+\b\s+", "", trade.symbol_option)
+                    if trade.symbol_option is not None
+                    else ""
+                ),
+                "code": wrap_text(trade.get_code(), 15),
                 "trade_type": trade.type.name,
                 "currency": trade.currency,
                 "timestamp": trade.timestamp,
-                "exchange_rate": ExchangeRate.at(
-                    trade.timestamp, trade.currency, trade.proceeds_closed()
+                "exchange_rate": round(
+                    ExchangeRate.at(trade.timestamp, trade.currency, trade.proceeds_closed()), 5
                 ),
                 "size": trade.size_closed(),
                 "price": trade.price,
-                "commission": trade.commission,
-                f"interest_{setup.BASE_CURRENCY}": trade.interest,
-                f"proceeds_{setup.BASE_CURRENCY}": trade.proceeds_closed(),
-                f"proceeds_{setup.BASE_CURRENCY}_open": trade.proceeds_open(),
-                f"net_gain_{setup.BASE_CURRENCY}": trade.net_gain(),
+                "commission": round(trade.commission, 2),
+                f"interest_{setup.BASE_CURRENCY}": round(trade.interest, 2),
+                f"proceeds_{setup.BASE_CURRENCY}": round(trade.proceeds_closed(), 2),
+                f"proceeds_{setup.BASE_CURRENCY}_open": round(trade.proceeds_open(), 2),
+                f"net_gain_{setup.BASE_CURRENCY}": round(trade.net_gain(), 2),
                 "comment": "",
             }
             if self.tax_rule is not None:
                 if not TradeFilter(self.tax_rule).include(trade, True):
                     row["comment"] = "Not tax relevant"
 
+            if not open_lots:
+                continue
             for i, cl in enumerate(trade.closed_lots):
                 row[f"timestamp_open{i:02d}"] = cl.timestamp
-                row[f"exchange_rate_open{i:02d}"] = ExchangeRate.at(
-                    cl.timestamp, cl.currency, cl.proceeds()
+                row[f"exchange_rate_open{i:02d}"] = round(
+                    ExchangeRate.at(cl.timestamp, cl.currency, cl.proceeds()), 5
                 )
                 row[f"size_open{i:02d}"] = cl.size
-                row[f"price_open{i:02d}"] = cl.price
-                row[f"commission_open{i:02d}"] = cl.commission
-                row[f"proceeds_{setup.BASE_CURRENCY}_open{i:02d}"] = cl.proceeds()
+                row[f"price_open{i:02d}"] = round(cl.price, 2)
+                row[f"commission_open{i:02d}"] = round(cl.commission, 2)
+                row[f"proceeds_{setup.BASE_CURRENCY}_open{i:02d}"] = round(cl.proceeds(), 2)
 
             rows.append(row)
         df = pd.DataFrame.from_records(rows)
         if excel_filename:
             df.to_excel(excel_filename, index=False)
         return df
+
+
+@dataclass
+# class _TaxPots(metaclass=Singleton):
+class TaxCalc:
+    _trade_filter: TradeFilter = field(init=False)
+    tax_rule: TaxRule
+    DIVIDEND_DE: float = 0.0  # Dividend (and Lieu of Dividend) for German stocks
+    DIVIDEND_OTHER: float = 0.0  # Dividend (and Lieu of Dividend) for non-German stocks
+    WRITER_PREMIUM: float = 0.0  # Stillhalterprämien
+    STOCK_GAIN: float = 0.0
+    OTHER_GAIN_LIMITED: float = 0.0  # Termingeschäfte i. S. d. dt. Steuerrechts
+    OTHER_GAIN: float = 0.0  # all other instruments
+    STOCK_LOSS: float = 0.0
+    OTHER_LOSS_LIMITED: float = 0.0  # Termingeschäfte; bis 20k € gem. §20 Abs. 6 S. 5
+    OTHER_LOSS: float = 0.0  # all other instruments
+    WORTHLESS_LIMITED: float = 0.0  # Wirtschaftsgüter; bis 20k € gem. §20 Abs. 6 S. 6
+    WITHHOLDING_TAX_DE: float = 0.0  # W. from dividend payments of German stocks
+    WITHHOLDING_TAX_OTHER: float = 0.0  # W. from dividend payments of non-German stocks
+    WITHHOLDING_TAX_OTHER_trades: TradeList = field(default_factory=TradeList)
+    DIVIDEND_DE_trades: TradeList = field(default_factory=TradeList)
+    DIVIDEND_OTHER_trades: TradeList = field(default_factory=TradeList)
+    WRITER_PREMIUM_trades: TradeList = field(default_factory=TradeList)
+    STOCK_GAIN_trades: TradeList = field(default_factory=TradeList)
+    OTHER_GAIN_LIMITED_trades: TradeList = field(default_factory=TradeList)
+    OTHER_GAIN_trades: TradeList = field(default_factory=TradeList)
+    STOCK_LOSS_trades: TradeList = field(default_factory=TradeList)
+    OTHER_LOSS_LIMITED_trades: TradeList = field(default_factory=TradeList)
+    OTHER_LOSS_trades: TradeList = field(default_factory=TradeList)
+    WORTHLESS_LIMITED_trades: TradeList = field(default_factory=TradeList)
+    WITHHOLDING_TAX_DE_trades: TradeList = field(default_factory=TradeList)
+
+    def __post_init__(self):
+        self._trade_filter = TradeFilter(self.tax_rule)
+
+    def __str__(self):
+        def amount_str(v: Union[float, int]):
+            return f"{v:>8d}.--" if isinstance(v, int) else f"{v:>11.2f}"
+
+        names = self._float_field_names()
+        b = setup.BASE_CURRENCY
+        pots = [f"{name:<21s} : {getattr(self, name):>11.2f} {b}" for name in names]
+        kap = [
+            f"KAP line {str(i):<12s} : {amount_str(v)} {b}  ({self.KAP_lines_annotations[i]})"
+            for i, v in self.KAP_lines.items()
+        ]
+        return "<TaxCalc\n  " + "\n  ".join(pots + ["---"] + kap) + ">"
+
+    def __repr__(self):
+        return self.__str__()
+
+    def _float_field_names(self):
+        return [f.name for f in fields(self) if f.type == "float"]
+
+    def add_trade(self, trade: Trade):
+        self._trade_filter.add_trade(trade, self)
+
+    def add_trades(self, trades: TradeList):
+        for i, trade in enumerate(trades):
+            self.add_trade(trade)
+
+    def KAP_line18(self) -> int:
+        """Inländische Kapitalerträge (ohne Betrag lt. Zeile 26)
+        (IBKR is a non-german broker, so "Inländische Kapitalerträge" is zero
+        except for dividends from German stocks)
+        """
+        s = self.DIVIDEND_DE + self.WITHHOLDING_TAX_DE
+        return tax_round(s, "down")
+
+    def KAP_line18_trades(self) -> list[Trade]:
+        return self.DIVIDEND_DE_trades + self.WITHHOLDING_TAX_DE_trades
+
+    def KAP_line19(self) -> int:
+        """Ausländische Kapitalerträge (ohne Betrag lt. Zeile 50)"""
+        s1 = sum(map(lambda x: getattr(self, x), self._float_field_names())) - (
+            self.DIVIDEND_DE + self.WITHHOLDING_TAX_DE
+        )
+        s2 = (
+            self.DIVIDEND_OTHER
+            + self.WRITER_PREMIUM
+            + self.STOCK_GAIN
+            + self.OTHER_GAIN
+            + self.OTHER_GAIN_LIMITED
+            + self.STOCK_LOSS  # losses have negative sign, so add them
+            + self.OTHER_LOSS
+            + self.OTHER_LOSS_LIMITED
+            + self.WORTHLESS_LIMITED
+            + self.WITHHOLDING_TAX_OTHER
+        )
+        assert s1 == s2
+        return tax_round(s1, "down")
+
+    def KAP_line19_trades(self) -> list[Trade]:
+        return (
+            self.DIVIDEND_OTHER_trades
+            + self.WRITER_PREMIUM_trades
+            + self.STOCK_GAIN_trades
+            + self.OTHER_GAIN_trades
+            + self.OTHER_GAIN_LIMITED_trades
+            + self.STOCK_LOSS_trades
+            + self.OTHER_LOSS_trades
+            + self.OTHER_LOSS_LIMITED_trades
+            + self.WORTHLESS_LIMITED_trades
+            + self.WITHHOLDING_TAX_OTHER_trades
+        )
+
+    def KAP_line20(self) -> int:
+        """In den Zeilen 18 und 19 enthaltene Gewinne aus Aktienveräußerungen
+        i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
+        (Anteile einer Körperschaft)
+        """
+        return tax_round(self.STOCK_GAIN, "down")
+
+    def KAP_line20_trades(self) -> list[Trade]:
+        return self.STOCK_GAIN_trades
+
+    def KAP_line21(self) -> int:
+        """In den Zeilen 18 und 19 enthaltene Einkünfte aus Stillhalterprämien
+        und Gewinne aus Termingeschäften
+        (entspricht vermutlich §20 Abs 1. Nr. 11 (Stillhalterprämien) und
+        §20 Abs. 2 Nr. 3 (steuerliche Termingeschäfte))
+        Unklar: Zertifikate, Optionsscheine etc.? -> vermutlich nicht
+        """
+        return tax_round(self.WRITER_PREMIUM + self.OTHER_GAIN_LIMITED, "down")
+
+    def KAP_line21_trades(self) -> list[Trade]:
+        return self.WRITER_PREMIUM_trades + self.OTHER_GAIN_LIMITED_trades
+
+    def KAP_line22(self) -> int:
+        """In den Zeilen 18 und 19 enthaltene Verluste ohne Verluste
+        aus der Veräußerung von Aktien
+        """
+        v = -self.OTHER_LOSS - self.OTHER_LOSS_LIMITED - self.WORTHLESS_LIMITED
+        return tax_round(v, "up")
+
+    def KAP_line22_trades(self) -> list[Trade]:
+        return (
+            self.OTHER_LOSS_trades + self.OTHER_LOSS_LIMITED_trades + self.WORTHLESS_LIMITED_trades
+        )
+
+    def KAP_line23(self) -> int:
+        """In den Zeilen 18 und 19 enthaltene Verluste aus der Veräußerung
+        von Aktien i. S. d. § 20 Abs. 2 Satz 1 Nr. 1 EStG
+        """
+        return tax_round(-self.STOCK_LOSS, "up")
+
+    def KAP_line23_trades(self) -> list[Trade]:
+        return self.STOCK_LOSS_trades
+
+    def KAP_line24(self) -> int:
+        """Verluste aus Termingeschäften gem. §20 Abs. 2 Nr. 3
+        (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 5 gilt,
+        nur verrechenbar mit §20 Abs 1. Nr. 11 (Stillhalterprämien) und
+        §20 Abs. 2 Nr. 3 (Gewinne aus steuerlichen Termingeschäften))"""
+        return tax_round(-self.OTHER_LOSS_LIMITED, "up")
+
+    def KAP_line24_trades(self) -> list[Trade]:
+        return self.OTHER_LOSS_LIMITED_trades
+
+    def KAP_line25(self) -> int:
+        """Verluste aus der ganzen oder teilweisen Uneinbringlichkeit einer
+        Kapitalforderung, Ausbuchung, Übertragung wertlos gewordener Wirtschaftsgüter
+        i. S. d. § 20 Abs. 1 EStG oder aus einem sonstigen Ausfall
+        von Wirtschaftsgütern i. S. d. § 20 Abs. 1 EStG
+        (Verluste, für die Verlustanrechnungsbeschränkung nach §20 Abs. 6 S. 6 gilt)
+        """
+        return tax_round(-self.WORTHLESS_LIMITED, "up")
+
+    def KAP_line25_trades(self) -> list[Trade]:
+        return self.WORTHLESS_LIMITED_trades
+
+    def KAP_line41(self):
+        """Noch anzurechnende ausländische Steuern"""
+        return round(-self.WITHHOLDING_TAX_OTHER, 2)
+
+    def KAP_line41_trades(self) -> list[Trade]:
+        return self.WITHHOLDING_TAX_OTHER_trades
+
+    def KAP_line43(self):
+        """Einbehaltene inländische Steuerabzüge: Anzurechnende Kapitalertragssteuer"""
+        # total fraction is 1.055 since aggregate value *includes* 5.5% Soli
+        # return tax_round(-self.WITHHOLDING_TAX_DE * (1 / 1.055), "up")
+        return round(-self.WITHHOLDING_TAX_DE * (1 / 1.055), 2)
+
+    def KAP_line43_trades(self) -> list[Trade]:
+        return self.WITHHOLDING_TAX_DE_trades
+
+    def KAP_line44(self):
+        """Einbehaltene inländische Steuerabzüge: Anzurechnender Solidaritätszuschlag"""
+        # return tax_round(-self.WITHHOLDING_TAX_DE * (0.055 / 1.055), "up")
+        return round(-self.WITHHOLDING_TAX_DE * (0.055 / 1.055), 2)
+
+    def KAP_line44_trades(self) -> list[Trade]:
+        return self.WITHHOLDING_TAX_DE_trades
+
+    @property
+    def KAP_lines(self) -> dict[int, float]:
+        result = {}
+        for i in list(range(18, 26)) + [41, 43, 44]:
+            result[i] = getattr(self, f"KAP_line{i}")()
+        return result
+
+    @property
+    def KAP_lines_trades(self) -> dict[int, TradeList]:
+        result = {}
+        for i in list(range(18, 26)) + [41, 43, 44]:
+            result[i] = getattr(self, f"KAP_line{i}_trades")()
+        return result
+
+    @property
+    def KAP_lines_annotations(self) -> dict[int, str]:
+        return {
+            18: "Inländische Kapitalerträge",
+            19: "Ausländische Kapitalerträge",
+            20: "In 18 und 19 enth. Gewinne aus Aktienveräußerungen",
+            21: "In 18 und 19 enth. Stillhalterprämien und Gewinne aus Termingeschäften",
+            22: "In 18 und 19 enth. Verluste (ohne Verluste Aktien)",
+            23: "In 18 und 19 enth. Verluste aus Aktien",
+            24: "Verluste aus Termingeschäften mit Verlustanrechnungsbeschränkung",
+            25: "Verluste aus Uneinbringlichkeit von Kapitalforderungen",
+            41: "Noch anzurechnende ausländische Steuern",
+            43: "Einbehaltene inländische Steuerabzüge: Anzurechnende Kapitalertragssteuer",
+            44: "Einbehaltene inländische Steuerabzüge: Anzurechnender Solidaritätszuschlag",
+        }
+
+
+class TradeFilter:
+    """Manager to implement different tax legislation (TaxRule)."""
+
+    def __init__(self, tax_rule: TaxRule):
+        self.tax_rule = tax_rule
+
+    def include(self, trade: Trade, silent: bool = False) -> bool:
+        if self.tax_rule == TaxRule.DE:
+            return True
+            # if (
+            #     trade.type in (ItemType.DIVIDEND_PAYOUT, ItemType.WITHHOLDING_TAX)
+            #     and trade.stock.country == "DE"
+            # ):
+            #     if not silent:
+            #         print(f"{self.tax_rule}: Already taxed => exclude from TaxReport: {trade}")
+            #     return False
+            # return True
+        else:
+            raise NotImplementedError()
+
+    def _add_trade_DE(self, trade: Trade, tax_calc: TaxCalc):
+        if self.include(trade) is False:
+            return
+        if trade.is_worthless:
+            tax_calc.WORTHLESS_LIMITED += trade.net_gain()
+            tax_calc.WORTHLESS_LIMITED_trades.append(trade)
+        elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country == "DE":
+            tax_calc.DIVIDEND_DE += trade.net_gain()
+            tax_calc.DIVIDEND_DE_trades.append(trade)
+        elif trade.type == ItemType.DIVIDEND_PAYOUT and trade.stock.country != "DE":
+            tax_calc.DIVIDEND_OTHER += trade.net_gain()
+            tax_calc.DIVIDEND_OTHER_trades.append(trade)
+        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country == "DE":
+            tax_calc.WITHHOLDING_TAX_DE += trade.net_gain()
+            tax_calc.WITHHOLDING_TAX_DE_trades.append(trade)
+        elif trade.type == ItemType.WITHHOLDING_TAX and trade.stock.country != "DE":
+            tax_calc.WITHHOLDING_TAX_OTHER += trade.net_gain()
+            tax_calc.WITHHOLDING_TAX_OTHER_trades.append(trade)
+        elif trade.type == ItemType.OPTION_SHORT_OPEN:
+            tax_calc.WRITER_PREMIUM += trade.net_gain()
+            tax_calc.WRITER_PREMIUM_trades.append(trade)
+        elif trade.type == ItemType.OPTION_SHORT_CLOSED:
+            # only closing half trade, since open was already added to writer premium
+            tax_calc.OTHER_LOSS += trade.proceeds_closed()
+            tax_calc.OTHER_LOSS_trades.append(trade)
+        elif trade.type == ItemType.OPTION_SHORT_EXERCISED_CASH_SETTLED:
+            # only closing half trade, since open was already added to writer premium
+            tax_calc.OTHER_LOSS_LIMITED += trade.proceeds_closed()
+            tax_calc.OTHER_LOSS_LIMITED_trades.append(trade)
+            raise NotImplementedError("Option short exercised cash settled not tested")
+        elif trade.type in (
+            ItemType.OPTION_LONG_EXERCISED_CASH_SETTLED,
+            ItemType.OPTION_LONG_CLOSED,
+            ItemType.OPTION_LONG_EXPIRED,
+            ItemType.CFD_LONG,
+            ItemType.CFD_SHORT,
+        ):
+            # all round trades classified as "Termingeschäfte i. S. d. dt. Steuerrechts"
+            tax_calc.OTHER_GAIN_LIMITED += max(trade.net_gain(), 0)
+            tax_calc.OTHER_LOSS_LIMITED += min(trade.net_gain(), 0)
+            if trade.net_gain() > 0:
+                tax_calc.OTHER_GAIN_LIMITED_trades.append(trade)
+            elif trade.net_gain() < 0:
+                tax_calc.OTHER_LOSS_LIMITED_trades.append(trade)
+        elif trade.type == ItemType.OPTION_LONG_EXERCISED:
+            raise NotImplementedError("Option long exercised not tested")
+            # todo: find corresponding stock trade and add option premium to cost
+        elif trade.type in (
+            ItemType.WARRANT_LONG,
+            ItemType.STRUCTURED_LONG,
+            ItemType.ETF_LONG,
+        ):
+            tax_calc.OTHER_GAIN += max(trade.net_gain(), 0)
+            tax_calc.OTHER_LOSS += min(trade.net_gain(), 0)
+            if trade.net_gain() > 0:
+                tax_calc.OTHER_GAIN_trades.append(trade)
+            elif trade.net_gain() < 0:
+                tax_calc.OTHER_LOSS_trades.append(trade)
+        elif trade.type in (ItemType.STOCK_LONG, ItemType.STOCK_SHORT):
+            tax_calc.STOCK_GAIN += max(trade.net_gain(), 0)
+            tax_calc.STOCK_LOSS += min(trade.net_gain(), 0)
+            if trade.net_gain() > 0:
+                tax_calc.STOCK_GAIN_trades.append(trade)
+            elif trade.net_gain() < 0:
+                tax_calc.STOCK_LOSS_trades.append(trade)
+        elif trade.type in (
+            ItemType.OPTION_LONG_OPEN,
+            ItemType.OPTION_SHORT_EXERCISED,
+            ItemType.OPTION_SHORT_EXPIRED,
+        ):
+            pass  # writer premium already considered; exercise via stock trade
+        else:
+            raise NotImplementedError(f"No TaxCalc for {trade.type}: {trade}")
+
+    def add_trade(self, trade: Trade, tax_calc: TaxCalc):
+        """Distribute outcome of a trade to the buckets of a TaxCalc object."""
+        return getattr(self, f"_add_trade_{self.tax_rule.name}")(trade, tax_calc)
