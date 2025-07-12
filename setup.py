@@ -12,3 +12,4 @@ CSV_REPORT = {
 }
 ACCOUNT = "U7953725"
 BASE_CURRENCY = "EUR"
+OUTPUT_DIR = "output"  # subdirecty for output xlsx and pdf
